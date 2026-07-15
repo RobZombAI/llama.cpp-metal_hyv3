@@ -170,24 +170,6 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-### Server (with reasoning + MTP)
-
-```bash
-./build/bin/llama-server \
-    -m ~/Downloads/Hy3-IQ1_M-mtp.gguf \
-    -c 65536 \
-    -ngl 99 -fa on \
-    --spec-type draft-mtp \
-    --spec-draft-n-max 3 \
-    --spec-draft-n-min 1 \
-    -ctk q8_0 -ctv q8_0 \
-    -ctkd q8_0 -ctvd q8_0 \
-    --temp 0.6 \
-    --reasoning on \
-    --reasoning-budget -1 \
-    --port 8080
-```
-
 ### For Mac with 96 GB RAM
 
 ```bash
