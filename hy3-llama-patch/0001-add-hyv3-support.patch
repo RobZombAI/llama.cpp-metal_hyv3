@@ -1,0 +1,383 @@
+From: AngelSlim <hy3-ml@github>
+Subject: [PATCH] Add Hy3 (hy_v3) architecture support to llama.cpp
+
+---
+Adds the Hunyuan V3 (hy_v3) MoE architecture:
+- 295B MoE, 81 layers, 192 experts (8 active)
+- MTP (Multi-Token Prediction) support
+- Sigmoid expert gating with correction bias
+- Shared expert + routed MoE FFN
+---
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 24e58ab06..56569383d 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -22,6 +22,7 @@
+ #include <functional>
+ 
+ #include <optional>
++#include <regex>
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
+@@ -1608,6 +1609,178 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
+     return data;
+ }
+ 
++// Hunyuan V3 (hy_v3) parser.
++// Reasoning: <think{sfx}>{reasoning}</think{sfx}>
++// Tool calls (constructed / tagged, key-value split):
++//   <tool_calls{sfx}>
++//   <tool_call{sfx}>{func-name}<tool_sep{sfx}>
++//   <arg_key{sfx}>{key}</arg_key{sfx}>
++//   <arg_value{sfx}>{value}</arg_value{sfx}>
++//   ...
++//   </tool_call{sfx}>
++//   </tool_calls{sfx}>
++// The special tokens carry a per-tokenizer suffix (e.g. ":opensource" or empty),
++// so we extract the concrete literals from the template source rather than
++// hard-coding them.
++static common_chat_params common_chat_params_init_hunyuan_v3(const common_chat_template &          tmpl,
++                                                             const autoparser::generation_params & inputs) {
++    common_chat_params data;
++
++    const std::string & src = tmpl.source();
++
++    // Pull the concrete token literal assigned to a jinja variable, e.g.
++    //   {%- set toolsep_token = '<tool_sep:opensource>' %}
++    auto extract_tok = [&src](const std::string & var, const std::string & fallback) -> std::string {
++        std::smatch m;
++        std::regex  re(var + R"(\s*=\s*'([^']*)')");
++        if (std::regex_search(src, m, re)) {
++            return m[1].str();
++        }
++        return fallback;
++    };
++
++    const std::string think_begin    = extract_tok("think_begin_token",       "<think>");
++    const std::string think_end      = extract_tok("think_end_token",         "</think>");
++    const std::string tcalls_begin   = extract_tok("toolcalls_begin_token",   "<tool_calls>");
++    const std::string tcalls_end     = extract_tok("toolcalls_end_token",     "</tool_calls>");
++    const std::string tcall_begin    = extract_tok("toolcall_begin_token",    "<tool_call>");
++    const std::string tcall_end      = extract_tok("toolcall_end_token",      "</tool_call>");
++    const std::string tsep           = extract_tok("toolsep_token",           "<tool_sep>");
++    const std::string argkey_begin   = extract_tok("argkey_begin_token",      "<arg_key>");
++    const std::string argkey_end     = extract_tok("argkey_end_token",        "</arg_key>");
++    const std::string argval_begin   = extract_tok("argvalue_begin_token",    "<arg_value>");
++    const std::string argval_end     = extract_tok("argvalue_end_token",      "</arg_value>");
++    const std::string assistant_tok  = extract_tok("assistant_token",         "");
++
++    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
++    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
++    auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
++
++    data.supports_thinking  = true;
++    data.thinking_start_tag = think_begin;
++    data.thinking_end_tag   = think_end;
++    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
++    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
++    data.preserved_tokens   = {
++        think_begin, think_end,
++        tcalls_begin, tcalls_end,
++        tcall_begin, tcall_end, tsep,
++        argkey_begin, argkey_end,
++        argval_begin, argval_end,
++    };
++
++    if (inputs.has_continuation()) {
++        const auto & msg = inputs.continue_msg;
++
++        data.generation_prompt = think_begin + msg.reasoning_content;
++        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
++            data.generation_prompt += think_end + msg.render_content();
++        }
++
++        data.prompt += data.generation_prompt;
++    }
++
++    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
++        // The generation prompt prefix that precedes the model's real output may
++        // still be present in the decoded text, in one of these shapes:
++        //   {assistant}                        (default)
++        //   {assistant}{think_begin}           (reasoning_effort low/high)
++        //   {assistant}{think_begin}{think_end}(reasoning_effort no_think)
++        // Consume an optional leading assistant token so it never leaks into content.
++        auto gen_prefix = assistant_tok.empty() ? p.eps() : p.optional(p.literal(assistant_tok));
++
++        // Reasoning block is optional: <think{sfx}>...</think{sfx}>
++        auto reasoning = extract_reasoning
++            ? p.optional(p.literal(think_begin) +
++                         p.reasoning(p.until(think_end)) +
++                         p.literal(think_end))
++            : p.eps();
++
++        // Content only (no tools)
++        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
++            include_grammar = false;
++            return gen_prefix + (reasoning << p.content(p.rest()));
++        }
++
++        // One tool call: <tool_call{sfx}>NAME<tool_sep{sfx}> {args} </tool_call{sfx}>
++        // where {args} is a sequence of
++        //   <arg_key{sfx}>KEY</arg_key{sfx}> <arg_value{sfx}>VALUE</arg_value{sfx}>
++        auto tool_choice = p.choice();
++        foreach_function(inputs.tools, [&](const json & tool) {
++            const auto & function = tool.at("function");
++            std::string  name     = function.at("name");
++            const json & params   = function.contains("parameters") ? function.at("parameters") : json::object();
++
++            // Build per-argument parsers restricted to schema-declared property names.
++            auto args = p.eps();
++            if (params.contains("properties") && !params.at("properties").empty()) {
++                auto arg_choice = p.choice();
++                for (const auto & el : params.at("properties").items()) {
++                    const std::string & prop = el.key();
++                    // Values for string-typed params are literal text (must be quoted in
++                    // the emitted JSON); other types are parsed as JSON/python scalars.
++                    std::string ptype;
++                    if (el.value().is_object() && el.value().contains("type") &&
++                        el.value().at("type").is_string()) {
++                        ptype = el.value().at("type").get<std::string>();
++                    }
++                    auto value_node = (ptype == "string")
++                        ? p.tool_arg_string_value(p.until(argval_end))
++                        : p.tool_arg_value(p.until(argval_end));
++                    arg_choice |= p.tool_arg(
++                        p.tool_arg_open(p.literal(argkey_begin)) +
++                        p.tool_arg_name(p.literal(prop)) +
++                        p.literal(argkey_end) + p.space() +
++                        p.literal(argval_begin) +
++                        value_node +
++                        p.tool_arg_close(p.literal(argval_end)));
++                }
++                args = p.zero_or_more(arg_choice + p.space());
++            }
++
++            auto tool_parser = p.tool(
++                p.tool_open(p.literal(tcall_begin) + p.tool_name(p.literal(name)) + p.literal(tsep)) +
++                p.space() + p.tool_args(args) + p.space() +
++                p.tool_close(p.literal(tcall_end)));
++
++            tool_choice |= p.rule("tool-" + name, tool_parser);
++        });
++
++        auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
++        auto min_calls  = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
++        // Section: <tool_calls{sfx}> (one or more tool calls) </tool_calls{sfx}>
++        auto tool_calls = p.trigger_rule("tool-call",
++            p.literal(tcalls_begin) + p.space() +
++            p.repeat(tool_choice + p.space(), min_calls, max_calls) +
++            p.optional(p.literal(tcalls_end)));
++
++        auto content_before_tools = p.content(p.until(tcalls_begin));
++
++        return gen_prefix + (reasoning << content_before_tools << tool_calls);
++    });
++
++    data.parser = parser.save();
++
++    if (include_grammar) {
++        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
++        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
++            foreach_function(inputs.tools, [&](const json & tool) {
++                const auto & function = tool.at("function");
++                auto         schema   = function.at("parameters");
++                builder.resolve_refs(schema);
++            });
++            parser.build_grammar(builder, data.grammar_lazy);
++        });
++
++        data.grammar_triggers = {
++            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, tcalls_begin }
++        };
++    }
++
++    return data;
++}
++
+ // LFM2/LFM2.5 parser. Tool calls are almost Python-style and parallel-capable
+ // (except dotted names and JSON literals true/false/null).
+ // Always wrapped in <|tool_call_start|>[name(args)]<|tool_call_end|> with optional <think> reasoning.
+@@ -2197,6 +2370,16 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
+         return common_chat_params_init_ministral_3(tmpl, params);
+     }
+ 
++    // Hunyuan V3 (hy_v3) - key/value split tagged tool calls with per-tokenizer
++    // suffixed special tokens. Detection: template defines the hy_v3-specific
++    // arg_key/arg_value and tool_sep jinja variables (suffix-independent).
++    if (src.find("argkey_begin_token") != std::string::npos &&
++        src.find("argvalue_begin_token") != std::string::npos &&
++        src.find("toolsep_token") != std::string::npos) {
++        LOG_DBG("Using specialized template: Hunyuan V3\n");
++        return common_chat_params_init_hunyuan_v3(tmpl, params);
++    }
++
+     // GPT-OSS - has unique channel-based structure that needs dedicated handler
+     if (src.find("<|channel|>") != std::string::npos) {
+         LOG_DBG("Using specialized template: GPT-OSS\n");
+diff --git a/conversion/__init__.py b/conversion/__init__.py
+index 18162976f..fbc701974 100644
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -101,6 +101,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "HunYuanDenseV1ForCausalLM": "hunyuan",
+     "HunYuanMoEV1ForCausalLM": "hunyuan",
+     "HunYuanVLForConditionalGeneration": "hunyuan",
++    "HYV3ForCausalLM": "hyv3",
+     "IQuestCoderForCausalLM": "llama",
+     "InternLM2ForCausalLM": "internlm",
+     "InternLM3ForCausalLM": "internlm",
+diff --git a/gguf-py/gguf/__init__.py b/gguf-py/gguf/__init__.py
+index 243defc4c..a39401789 100644
+--- a/gguf-py/gguf/__init__.py
++++ b/gguf-py/gguf/__init__.py
+@@ -7,3 +7,5 @@ from .tensor_mapping import *
+ from .vocab import *
+ from .utility import *
+ from .metadata import *
++
++__version__ = "0.19.0"
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index bd6246137..099e6bb0c 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -492,6 +492,7 @@ class MODEL_ARCH(IntEnum):
+     ERNIE4_5         = auto()
+     ERNIE4_5_MOE     = auto()
+     HUNYUAN_MOE      = auto()
++    HYV3             = auto()
+     HUNYUAN_DENSE    = auto()
+     HUNYUAN_VL       = auto()
+     SMOLLM3          = auto()
+@@ -1042,6 +1043,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.ERNIE4_5_MOE:     "ernie4_5-moe",
+     MODEL_ARCH.FALCON_H1:        "falcon-h1",
+     MODEL_ARCH.HUNYUAN_MOE:      "hunyuan-moe",
++    MODEL_ARCH.HYV3:             "hy_v3",
+     MODEL_ARCH.HUNYUAN_DENSE:    "hunyuan-dense",
+     MODEL_ARCH.HUNYUAN_VL:       "hunyuan_vl",
+     MODEL_ARCH.SMOLLM3:          "smollm3",
+@@ -3755,6 +3757,37 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.FFN_DOWN_SHEXP,
+         MODEL_TENSOR.FFN_UP_SHEXP,
+     ],
++    MODEL_ARCH.HYV3: [
++        MODEL_TENSOR.TOKEN_EMBD,
++        MODEL_TENSOR.OUTPUT_NORM,
++        MODEL_TENSOR.OUTPUT,
++        MODEL_TENSOR.ATTN_NORM,
++        MODEL_TENSOR.ATTN_Q,
++        MODEL_TENSOR.ATTN_Q_NORM,
++        MODEL_TENSOR.ATTN_K,
++        MODEL_TENSOR.ATTN_K_NORM,
++        MODEL_TENSOR.ATTN_V,
++        MODEL_TENSOR.ATTN_OUT,
++        MODEL_TENSOR.FFN_NORM,
++        MODEL_TENSOR.FFN_GATE,
++        MODEL_TENSOR.FFN_DOWN,
++        MODEL_TENSOR.FFN_UP,
++        MODEL_TENSOR.FFN_GATE_INP,
++        MODEL_TENSOR.FFN_EXP_PROBS_B,
++        MODEL_TENSOR.FFN_GATE_EXP,
++        MODEL_TENSOR.FFN_DOWN_EXP,
++        MODEL_TENSOR.FFN_UP_EXP,
++        MODEL_TENSOR.FFN_GATE_UP_EXP,
++        MODEL_TENSOR.FFN_GATE_SHEXP,
++        MODEL_TENSOR.FFN_DOWN_SHEXP,
++        MODEL_TENSOR.FFN_UP_SHEXP,
++        MODEL_TENSOR.NEXTN_EH_PROJ,
++        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
++        MODEL_TENSOR.NEXTN_ENORM,
++        MODEL_TENSOR.NEXTN_HNORM,
++        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
++        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
++    ],
+     MODEL_ARCH.HUNYUAN_DENSE: [
+         MODEL_TENSOR.TOKEN_EMBD,
+         MODEL_TENSOR.OUTPUT_NORM,
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index a9537983d..99cf5158a 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -2397,6 +2397,7 @@ class TensorNameMap:
+ 
+         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
+             "model.layers.{bid}.shared_head.norm",
++            "model.layers.{bid}.final_layernorm",       # hy_v3 MTP
+         ),
+     }
+ 
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 6a5d5f8d2..888cafcb2 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -110,6 +110,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_ERNIE4_5,         "ernie4_5"         },
+     { LLM_ARCH_ERNIE4_5_MOE,     "ernie4_5-moe"     },
+     { LLM_ARCH_HUNYUAN_MOE,      "hunyuan-moe"      },
++    { LLM_ARCH_HYV3,             "hy_v3"            },
+     { LLM_ARCH_HUNYUAN_DENSE,    "hunyuan-dense"    },
+     { LLM_ARCH_HUNYUAN_VL,       "hunyuan_vl"       },
+     { LLM_ARCH_SMOLLM3,          "smollm3"          },
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 03b1a265d..88c9236b5 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -114,6 +114,7 @@ enum llm_arch {
+     LLM_ARCH_ERNIE4_5,
+     LLM_ARCH_ERNIE4_5_MOE,
+     LLM_ARCH_HUNYUAN_MOE,
++    LLM_ARCH_HYV3,
+     LLM_ARCH_HUNYUAN_DENSE,
+     LLM_ARCH_HUNYUAN_VL,
+     LLM_ARCH_SMOLLM3,
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 4f12e0949..a03b39ecc 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -253,6 +253,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_paddleocr(params);
+         case LLM_ARCH_HUNYUAN_MOE:
+             return new llama_model_hunyuan_moe(params);
++        case LLM_ARCH_HYV3:
++            return new llama_model_hyv3(params);
+         case LLM_ARCH_HUNYUAN_VL:
+             return new llama_model_hunyuan_vl(params);
+         case LLM_ARCH_HUNYUAN_DENSE:
+@@ -2479,6 +2481,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_STEP35:
+         case LLM_ARCH_TALKIE:
+         case LLM_ARCH_MELLUM:
++        case LLM_ARCH_HYV3:
+             return LLAMA_ROPE_TYPE_NEOX;
+ 
+         case LLM_ARCH_QWEN2VL:
+diff --git a/src/models/models.h b/src/models/models.h
+index c137e32e8..641fdf9e9 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1566,6 +1566,22 @@ struct llama_model_hunyuan_moe : public llama_model_base {
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
+ 
++struct llama_model_hyv3 : public llama_model_base {
++    llama_model_hyv3(const struct llama_model_params & params) : llama_model_base(params) {}
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    struct graph : public llm_graph_context {
++        graph(const llama_model & model, const llm_graph_params & params);
++    };
++
++    struct graph_mtp : public llm_graph_context {
++        graph_mtp(const llama_model & model, const llm_graph_params & params);
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
+ 
+ struct llama_model_hunyuan_vl : public llama_model_base {
+     llama_model_hunyuan_vl(const struct llama_model_params & params) : llama_model_base(params) {}
