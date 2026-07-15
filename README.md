@@ -100,7 +100,7 @@ cp /path/to/hyv3.cpp src/models/
 Or clone the ready-made fork:
 
 ```bash
-git clone https://github.com/<your-username>/llama.cpp-hyv3
+git clone https://github.com/RobZombAI/llama.cpp-metal_hyv3
 cd llama.cpp-hyv3
 ```
 
