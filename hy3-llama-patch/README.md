@@ -145,23 +145,6 @@ make -j$(sysctl -n hw.logicalcpu)
     --reasoning-budget -1
 ```
 
-### CLI (with MTP self-speculative — higher throughput)
-
-```bash
-./build/bin/llama-cli \
-    -m ~/Downloads/Hy3-IQ1_M-mtp.gguf \
-    -c 65536 \
-    -ngl 99 -fa on \
-    --spec-type draft-mtp \
-    --spec-draft-n-max 3 \
-    --spec-draft-n-min 1 \
-    -ctk q8_0 -ctv q8_0 \
-    -ctkd q8_0 -ctvd q8_0 \
-    -p "Hello" \
-    -n 200 \
-    --temp 0.6
-```
-
 ### Server (OpenAI-compatible API)
 
 ```bash
